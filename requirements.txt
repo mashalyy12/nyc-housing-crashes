@@ -1,0 +1,9 @@
+pandas
+numpy
+matplotlib
+seaborn
+plotly
+dash
+statsmodels
+gunicorn
+jupyter
