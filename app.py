@@ -1,27 +1,29 @@
 
 from pathlib import Path
+import os
 
 import pandas as pd
+import pyarrow.parquet as pq
 import plotly.express as px
 
-from dash import Dash, dcc, html, Input, Output
+from dash import Dash, dcc, html, Input, Output, State
 
 
-# --------------------------------------------------
+# ==================================================
 # 1. PROJECT PATHS
-# --------------------------------------------------
+# ==================================================
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 
-HOUSING_PATH = DATA_DIR / "housing.csv"
-CRASHES_PATH = DATA_DIR / "crashes.csv"
-INTEGRATED_PATH = DATA_DIR / "integrated_clean.csv"
+HOUSING_PATH = DATA_DIR / "housing_clean.csv"
+CRASHES_PATH = DATA_DIR / "crashes_clean.parquet"
+INTEGRATED_PATH = DATA_DIR / "integrated_clean_updated.csv"
 
 
-# --------------------------------------------------
+# ==================================================
 # 2. CHECK DATA FILES
-# --------------------------------------------------
+# ==================================================
 
 for file_path in [HOUSING_PATH, CRASHES_PATH, INTEGRATED_PATH]:
     if not file_path.exists():
@@ -30,60 +32,83 @@ for file_path in [HOUSING_PATH, CRASHES_PATH, INTEGRATED_PATH]:
         )
 
 
-# --------------------------------------------------
-# 3. LOAD HOUSING DATA
-# --------------------------------------------------
+# ==================================================
+# 3. LOAD AND PREPARE HOUSING DATA
+# ==================================================
 
-housing = pd.read_csv(
-    HOUSING_PATH,
-    usecols=["Borough", "All Counted Units"]
-)
+housing = pd.read_csv(HOUSING_PATH)
 
-housing["BOROUGH_KEY"] = (
+housing["BOROUGH_DASH"] = (
     housing["Borough"]
     .astype("string")
     .str.strip()
     .str.upper()
 )
 
-housing["All Counted Units"] = pd.to_numeric(
-    housing["All Counted Units"],
+housing["YEAR"] = pd.to_datetime(
+    housing["Project Start Date"],
     errors="coerce"
+).dt.year
+
+HOUSING_UNIT_COLUMNS = [
+    "All Counted Units",
+    "Extremely Low Income Units",
+    "Very Low Income Units",
+    "Low Income Units",
+    "Moderate Income Units",
+    "Middle Income Units",
+    "Other Income Units"
+]
+
+for col in HOUSING_UNIT_COLUMNS:
+    housing[col] = pd.to_numeric(
+        housing[col],
+        errors="coerce"
+    ).fillna(0)
+
+housing_long = housing.melt(
+    id_vars=["BOROUGH_DASH", "YEAR"],
+    value_vars=HOUSING_UNIT_COLUMNS,
+    var_name="Income_Category",
+    value_name="Units"
 )
 
 housing_summary = (
-    housing.dropna(subset=["BOROUGH_KEY"])
-    .groupby("BOROUGH_KEY", as_index=False)
-    .agg(
-        Housing_Units=(
-            "All Counted Units",
-            lambda x: x.sum(min_count=1)
-        )
+    housing_long
+    .groupby(
+        ["BOROUGH_DASH", "YEAR", "Income_Category"],
+        as_index=False,
+        dropna=False
     )
+    .agg(Housing_Units=("Units", "sum"))
 )
 
 
-# --------------------------------------------------
+# ==================================================
 # 4. LOAD AND SUMMARIZE CRASH DATA
-#    Read in chunks to reduce memory usage.
-# --------------------------------------------------
-
-borough_parts = []
-hour_parts = []
+#    Read Parquet in batches to reduce memory usage.
+# ==================================================
 
 CRASH_COLUMNS = [
     "BOROUGH",
+    "CRASH DATE",
     "CRASH TIME",
     "NUMBER OF PERSONS INJURED",
-    "NUMBER OF PERSONS KILLED"
+    "NUMBER OF PERSONS KILLED",
+    "CONTRIBUTING FACTOR VEHICLE 1"
 ]
 
-for chunk in pd.read_csv(
-    CRASHES_PATH,
-    usecols=CRASH_COLUMNS,
-    chunksize=150_000,
-    low_memory=False
+crash_parts = []
+hour_parts = []
+
+parquet_file = pq.ParquetFile(CRASHES_PATH)
+
+for batch in parquet_file.iter_batches(
+    batch_size=200_000,
+    columns=CRASH_COLUMNS
 ):
+
+    chunk = batch.to_pandas()
 
     chunk["BOROUGH_DASH"] = (
         chunk["BOROUGH"]
@@ -92,6 +117,26 @@ for chunk in pd.read_csv(
         .str.upper()
         .fillna("UNKNOWN")
     )
+
+    chunk["YEAR"] = pd.to_datetime(
+        chunk["CRASH DATE"],
+        errors="coerce"
+    ).dt.year
+
+    # CRASH TIME is already stored as an hour
+    # in the cleaned dataset.
+    chunk["CRASH_HOUR"] = pd.to_numeric(
+        chunk["CRASH TIME"],
+        errors="coerce"
+    )
+
+    # Support HH:MM format as well, if encountered.
+    if chunk["CRASH_HOUR"].isna().all():
+        chunk["CRASH_HOUR"] = pd.to_datetime(
+            chunk["CRASH TIME"].astype("string"),
+            format="%H:%M",
+            errors="coerce"
+        ).dt.hour
 
     chunk["INJURED_N"] = pd.to_numeric(
         chunk["NUMBER OF PERSONS INJURED"],
@@ -103,95 +148,184 @@ for chunk in pd.read_csv(
         errors="coerce"
     )
 
-    chunk["CRASH HOUR"] = pd.to_datetime(
-        chunk["CRASH TIME"].astype("string").str.strip(),
-        format="%H:%M",
-        errors="coerce"
-    ).dt.hour
+    chunk["CRASH_FACTOR"] = (
+        chunk["CONTRIBUTING FACTOR VEHICLE 1"]
+        .astype("string")
+        .str.strip()
+        .replace("", pd.NA)
+        .fillna("Unspecified")
+    )
 
-    # Crashes and injury totals by borough
-    borough_piece = (
-        chunk.groupby("BOROUGH_DASH")
+    # Summary by borough, year and contributing factor
+    crash_piece = (
+        chunk.groupby(
+            ["BOROUGH_DASH", "YEAR", "CRASH_FACTOR"],
+            dropna=False
+        )
         .agg(
             Number_of_Crashes=("BOROUGH_DASH", "size"),
             Total_Injured=("INJURED_N", "sum"),
             Total_Killed=("KILLED_N", "sum")
         )
+        .reset_index()
     )
 
-    borough_parts.append(borough_piece)
+    crash_parts.append(crash_piece)
 
-    # Crashes by borough and hour
+    # Summary by hour
     hour_piece = (
-        chunk.dropna(subset=["CRASH HOUR"])
-        .groupby(["BOROUGH_DASH", "CRASH HOUR"])
+        chunk.dropna(subset=["CRASH_HOUR"])
+        .groupby(
+            [
+                "BOROUGH_DASH",
+                "YEAR",
+                "CRASH_FACTOR",
+                "CRASH_HOUR"
+            ]
+        )
         .size()
         .rename("Number_of_Crashes")
-        .to_frame()
+        .reset_index()
     )
 
     hour_parts.append(hour_piece)
 
 
+# Combine summaries from all batches
 crash_summary = (
-    pd.concat(borough_parts)
-    .groupby(level=0)
-    .sum()
-    .reset_index()
+    pd.concat(crash_parts, ignore_index=True)
+    .groupby(
+        ["BOROUGH_DASH", "YEAR", "CRASH_FACTOR"],
+        as_index=False,
+        dropna=False
+    )
+    .agg(
+        Number_of_Crashes=("Number_of_Crashes", "sum"),
+        Total_Injured=("Total_Injured", "sum"),
+        Total_Killed=("Total_Killed", "sum")
+    )
 )
 
 hourly_summary = (
-    pd.concat(hour_parts)
-    .groupby(level=[0, 1])
-    .sum()
-    .reset_index()
+    pd.concat(hour_parts, ignore_index=True)
+    .groupby(
+        [
+            "BOROUGH_DASH",
+            "YEAR",
+            "CRASH_FACTOR",
+            "CRASH_HOUR"
+        ],
+        as_index=False
+    )
+    .agg(Number_of_Crashes=("Number_of_Crashes", "sum"))
 )
 
 
-# --------------------------------------------------
+# ==================================================
 # 5. LOAD INTEGRATED DATA
-# --------------------------------------------------
+# ==================================================
 
 integrated = pd.read_csv(INTEGRATED_PATH)
 
+integrated["Borough"] = (
+    integrated["Borough"]
+    .astype("string")
+    .str.strip()
+    .str.upper()
+)
+
+integrated["Postcode"] = (
+    integrated["Postcode"]
+    .astype("string")
+    .str.strip()
+)
+
+for col in [
+    "counted_housing_units",
+    "total_crashes",
+    "total_injured",
+    "total_killed"
+]:
+    integrated[col] = pd.to_numeric(
+        integrated[col],
+        errors="coerce"
+    ).fillna(0)
+
 matched_data = integrated[
-    integrated["MATCH_STATUS"] == "Matched"
+    integrated["match_status"] == "Matched"
 ].copy()
 
-matched_data["Housing_Total_Units"] = pd.to_numeric(
-    matched_data["Housing_Total_Units"],
-    errors="coerce"
+
+# ==================================================
+# 6. FILTER OPTIONS
+# ==================================================
+
+boroughs = sorted(
+    housing_summary["BOROUGH_DASH"].dropna().unique()
 )
-
-matched_data["Number_of_Crashes"] = pd.to_numeric(
-    matched_data["Number_of_Crashes"],
-    errors="coerce"
-)
-
-matched_data = matched_data.dropna(
-    subset=["Housing_Total_Units", "Number_of_Crashes"]
-)
-
-
-# --------------------------------------------------
-# 6. DASHBOARD SETUP
-# --------------------------------------------------
-
-app = Dash(__name__)
-app.title = "NYC Housing and Crash Dashboard"
-
 
 borough_options = [
     {"label": "All Boroughs", "value": "ALL"}
 ]
 
 borough_options += [
-    {"label": b.title(), "value": b}ks
-    for b in sorted(housing_summary["BOROUGH_KEY"].unique())
+    {"label": borough.title(), "value": borough}
+    for borough in boroughs
+]
+
+years = sorted(
+    set(housing_summary["YEAR"].dropna().astype(int))
+    | set(crash_summary["YEAR"].dropna().astype(int))
+)
+
+year_options = [
+    {"label": "All Years", "value": "ALL"}
+]
+
+year_options += [
+    {"label": str(year), "value": year}
+    for year in years
+]
+
+housing_options = [
+    {"label": "All Counted Units", "value": "All Counted Units"},
+    {"label": "Extremely Low Income", "value": "Extremely Low Income Units"},
+    {"label": "Very Low Income", "value": "Very Low Income Units"},
+    {"label": "Low Income", "value": "Low Income Units"},
+    {"label": "Moderate Income", "value": "Moderate Income Units"},
+    {"label": "Middle Income", "value": "Middle Income Units"},
+    {"label": "Other Income", "value": "Other Income Units"}
+]
+
+top_factors = (
+    crash_summary.groupby("CRASH_FACTOR")["Number_of_Crashes"]
+    .sum()
+    .sort_values(ascending=False)
+    .head(12)
+    .index.tolist()
+)
+
+crash_options = [
+    {"label": "All Contributing Factors", "value": "ALL"}
+]
+
+crash_options += [
+    {"label": factor, "value": factor}
+    for factor in top_factors
 ]
 
 
+# ==================================================
+# 7. DASHBOARD SETUP
+# ==================================================
+
+app = Dash(__name__)
+server = app.server
+app.title = "NYC Housing and Crash Dashboard"
+
+
 def metric_card(title, component_id):
+
     return html.Div(
         [
             html.P(
@@ -201,6 +335,7 @@ def metric_card(title, component_id):
                     "fontSize": "14px"
                 }
             ),
+
             html.H2(
                 id=component_id,
                 children="Loading...",
@@ -210,6 +345,7 @@ def metric_card(title, component_id):
                 }
             )
         ],
+
         style={
             "backgroundColor": "white",
             "padding": "20px",
@@ -218,6 +354,10 @@ def metric_card(title, component_id):
         }
     )
 
+
+# ==================================================
+# 8. DASHBOARD LAYOUT
+# ==================================================
 
 app.layout = html.Div(
     [
@@ -229,11 +369,13 @@ app.layout = html.Div(
                     "NYC Housing & Traffic Dashboard",
                     style={"marginBottom": "8px"}
                 ),
+
                 html.P(
-                    "Explore affordable housing and motor vehicle collisions "
-                    "across New York City."
+                    "Explore affordable housing and motor vehicle "
+                    "collisions across New York City."
                 )
             ],
+
             style={
                 "backgroundColor": "#172554",
                 "color": "white",
@@ -243,25 +385,93 @@ app.layout = html.Div(
             }
         ),
 
-        # FILTER
+        # SEARCH
         html.Div(
             [
                 html.Label(
-                    "Select Borough",
-                    style={
-                        "fontWeight": "bold",
-                        "marginBottom": "8px"
-                    }
+                    "Search Borough or ZIP Code",
+                    style={"fontWeight": "bold"}
                 ),
-                dcc.Dropdown(
-                    id="borough-filter",
-                    options=borough_options,
-                    value="ALL",
-                    clearable=False
+
+                dcc.Input(
+                    id="search-input",
+                    type="text",
+                    placeholder="Enter borough or ZIP code...",
+                    debounce=True,
+                    style={
+                        "width": "100%",
+                        "padding": "12px",
+                        "borderRadius": "8px",
+                        "border": "1px solid #cbd5e1",
+                        "marginTop": "8px"
+                    }
                 )
             ],
+
             style={
-                "maxWidth": "400px",
+                "maxWidth": "500px",
+                "marginBottom": "20px"
+            }
+        ),
+
+        # FILTERS
+        html.Div(
+            [
+
+                html.Div(
+                    [
+                        html.Label("Select Borough"),
+                        dcc.Dropdown(
+                            id="borough-filter",
+                            options=borough_options,
+                            value="ALL",
+                            clearable=False
+                        )
+                    ]
+                ),
+
+                html.Div(
+                    [
+                        html.Label("Select Year"),
+                        dcc.Dropdown(
+                            id="year-filter",
+                            options=year_options,
+                            value="ALL",
+                            clearable=False
+                        )
+                    ]
+                ),
+
+                html.Div(
+                    [
+                        html.Label("Housing Category"),
+                        dcc.Dropdown(
+                            id="housing-category-filter",
+                            options=housing_options,
+                            value="All Counted Units",
+                            clearable=False
+                        )
+                    ]
+                ),
+
+                html.Div(
+                    [
+                        html.Label("Crash Category"),
+                        dcc.Dropdown(
+                            id="crash-category-filter",
+                            options=crash_options,
+                            value="ALL",
+                            clearable=False
+                        )
+                    ]
+                )
+
+            ],
+
+            style={
+                "display": "grid",
+                "gridTemplateColumns": "repeat(auto-fit, minmax(210px, 1fr))",
+                "gap": "16px",
                 "marginBottom": "25px"
             }
         ),
@@ -270,22 +480,26 @@ app.layout = html.Div(
         html.Div(
             [
                 metric_card(
-                    "Counted Affordable Housing Units",
+                    "Counted Housing Units",
                     "housing-kpi"
                 ),
+
                 metric_card(
                     "Reported Motor Vehicle Crashes",
                     "crashes-kpi"
                 ),
+
                 metric_card(
                     "Recorded Persons Injured",
                     "injuries-kpi"
                 ),
+
                 metric_card(
                     "Recorded Persons Killed",
                     "fatalities-kpi"
                 )
             ],
+
             style={
                 "display": "grid",
                 "gridTemplateColumns": "repeat(auto-fit, minmax(210px, 1fr))",
@@ -297,6 +511,7 @@ app.layout = html.Div(
         # CHARTS
         html.Div(
             [
+
                 html.Div(
                     dcc.Graph(id="housing-chart"),
                     style={
@@ -332,7 +547,9 @@ app.layout = html.Div(
                         "padding": "12px"
                     }
                 )
+
             ],
+
             style={
                 "display": "grid",
                 "gridTemplateColumns": "repeat(auto-fit, minmax(400px, 1fr))",
@@ -340,13 +557,36 @@ app.layout = html.Div(
             }
         ),
 
+        # REPORT BUTTON
+        html.Div(
+            [
+                html.Button(
+                    "Generate Report (CSV)",
+                    id="generate-report",
+                    n_clicks=0,
+                    style={
+                        "backgroundColor": "#172554",
+                        "color": "white",
+                        "padding": "13px 24px",
+                        "border": "none",
+                        "borderRadius": "8px",
+                        "fontWeight": "bold",
+                        "cursor": "pointer",
+                        "marginTop": "25px"
+                    }
+                ),
+
+                dcc.Download(id="download-report")
+            ]
+        ),
+
         # FOOTNOTE
         html.P(
-            "Source: NYC Housing and Development and NYC Motor Vehicle "
-            "Collisions datasets. Crash totals cover the full available "
-            "collision dataset. The postcode comparison includes only "
-            "matched borough-postcode locations. Counts are not adjusted "
-            "for population or traffic volume.",
+            "Sources: NYC Housing and Development and NYC Motor Vehicle "
+            "Collisions datasets. Year filtering uses housing project start "
+            "dates and crash dates. The ZIP-code comparison uses matched "
+            "geographic groups and covers the full available period. "
+            "Counts are not adjusted for population or traffic volume.",
             style={
                 "color": "#64748b",
                 "fontSize": "12px",
@@ -355,6 +595,7 @@ app.layout = html.Div(
         )
 
     ],
+
     style={
         "fontFamily": "Arial, sans-serif",
         "backgroundColor": "#f1f5f9",
@@ -366,39 +607,28 @@ app.layout = html.Div(
 )
 
 
-# --------------------------------------------------
-# 7. INTERACTIVE DASHBOARD
-# --------------------------------------------------
+# ==================================================
+# 9. FILTERING FUNCTION
+# ==================================================
 
-@app.callback(
-    Output("housing-chart", "figure"),
-    Output("crash-chart", "figure"),
-    Output("hour-chart", "figure"),
-    Output("integration-chart", "figure"),
-    Output("housing-kpi", "children"),
-    Output("crashes-kpi", "children"),
-    Output("injuries-kpi", "children"),
-    Output("fatalities-kpi", "children"),
-    Input("borough-filter", "value")
-)
+def get_filtered_data(
+    selected_borough,
+    selected_year,
+    search_term,
+    selected_housing_category,
+    selected_crash_factor
+):
 
-def update_dashboard(selected_borough):
-
-    # Filter housing
     housing_view = housing_summary.copy()
-
-    # Filter crashes
     crash_view = crash_summary.copy()
-
-    # Filter hourly data
     hour_view = hourly_summary.copy()
-
-    # Filter integrated data
     integrated_view = matched_data.copy()
 
+    # Borough filter
     if selected_borough != "ALL":
+
         housing_view = housing_view[
-            housing_view["BOROUGH_KEY"] == selected_borough
+            housing_view["BOROUGH_DASH"] == selected_borough
         ]
 
         crash_view = crash_view[
@@ -410,10 +640,128 @@ def update_dashboard(selected_borough):
         ]
 
         integrated_view = integrated_view[
-            integrated_view["BOROUGH_KEY"] == selected_borough
+            integrated_view["Borough"] == selected_borough
         ]
 
-    # Summary numbers
+    # Year filter
+    if selected_year != "ALL":
+
+        housing_view = housing_view[
+            housing_view["YEAR"] == int(selected_year)
+        ]
+
+        crash_view = crash_view[
+            crash_view["YEAR"] == int(selected_year)
+        ]
+
+        hour_view = hour_view[
+            hour_view["YEAR"] == int(selected_year)
+        ]
+
+    # Housing category filter
+    housing_view = housing_view[
+        housing_view["Income_Category"] == selected_housing_category
+    ]
+
+    # Crash category filter
+    if selected_crash_factor != "ALL":
+
+        crash_view = crash_view[
+            crash_view["CRASH_FACTOR"] == selected_crash_factor
+        ]
+
+        hour_view = hour_view[
+            hour_view["CRASH_FACTOR"] == selected_crash_factor
+        ]
+
+    # Search functionality
+    search_term = str(search_term or "").strip().upper()
+
+    if search_term:
+
+        borough_matches = [
+            b for b in boroughs
+            if search_term in b
+        ]
+
+        if borough_matches:
+
+            housing_view = housing_view[
+                housing_view["BOROUGH_DASH"].isin(borough_matches)
+            ]
+
+            crash_view = crash_view[
+                crash_view["BOROUGH_DASH"].isin(borough_matches)
+            ]
+
+            hour_view = hour_view[
+                hour_view["BOROUGH_DASH"].isin(borough_matches)
+            ]
+
+            integrated_view = integrated_view[
+                integrated_view["Borough"].isin(borough_matches)
+            ]
+
+        else:
+
+            integrated_view = integrated_view[
+                integrated_view["Postcode"].str.contains(
+                    search_term,
+                    na=False,
+                    regex=False
+                )
+            ]
+
+    return (
+        housing_view,
+        crash_view,
+        hour_view,
+        integrated_view
+    )
+
+
+# ==================================================
+# 10. INTERACTIVE DASHBOARD CALLBACK
+# ==================================================
+
+@app.callback(
+
+    Output("housing-chart", "figure"),
+    Output("crash-chart", "figure"),
+    Output("hour-chart", "figure"),
+    Output("integration-chart", "figure"),
+
+    Output("housing-kpi", "children"),
+    Output("crashes-kpi", "children"),
+    Output("injuries-kpi", "children"),
+    Output("fatalities-kpi", "children"),
+
+    Input("borough-filter", "value"),
+    Input("year-filter", "value"),
+    Input("search-input", "value"),
+    Input("housing-category-filter", "value"),
+    Input("crash-category-filter", "value")
+)
+
+def update_dashboard(
+    selected_borough,
+    selected_year,
+    search_term,
+    selected_housing_category,
+    selected_crash_factor
+):
+
+    housing_view, crash_view, hour_view, integrated_view = (
+        get_filtered_data(
+            selected_borough,
+            selected_year,
+            search_term,
+            selected_housing_category,
+            selected_crash_factor
+        )
+    )
+
+    # KPI VALUES
     housing_total = housing_view["Housing_Units"].sum()
 
     crashes_total = crash_view["Number_of_Crashes"].sum()
@@ -423,40 +771,53 @@ def update_dashboard(selected_borough):
     fatalities_total = crash_view["Total_Killed"].sum()
 
     # HOUSING CHART
-    housing_fig = px.bar(
-        housing_view,
-        x="BOROUGH_KEY",
-        y="Housing_Units",
-        title="Affordable Housing Units by Borough",
-        labels={
-            "BOROUGH_KEY": "Borough",
-            "Housing_Units": "Counted Housing Units"
-        }
+    housing_plot = (
+        housing_view[
+            housing_view["BOROUGH_DASH"] != "UNKNOWN"
+        ]
+        .groupby("BOROUGH_DASH", as_index=False)
+        .agg(Housing_Units=("Housing_Units", "sum"))
     )
 
-    housing_fig.update_layout(template="plotly_white")
+    housing_fig = px.bar(
+        housing_plot,
+        x="BOROUGH_DASH",
+        y="Housing_Units",
+        title=f"{selected_housing_category} by Borough",
+        labels={
+            "BOROUGH_DASH": "Borough",
+            "Housing_Units": "Housing Units"
+        },
+        template="plotly_white"
+    )
 
     # CRASH CHART
-    crash_view = crash_view[
-        crash_view["BOROUGH_DASH"] != "UNKNOWN"
-    ]
+    crash_plot = (
+        crash_view[
+            crash_view["BOROUGH_DASH"] != "UNKNOWN"
+        ]
+        .groupby("BOROUGH_DASH", as_index=False)
+        .agg(
+            Number_of_Crashes=("Number_of_Crashes", "sum")
+        )
+    )
 
     crash_fig = px.bar(
-        crash_view,
+        crash_plot,
         x="BOROUGH_DASH",
         y="Number_of_Crashes",
         title="Reported Collisions by Borough",
         labels={
             "BOROUGH_DASH": "Borough",
             "Number_of_Crashes": "Reported Crashes"
-        }
+        },
+        template="plotly_white"
     )
-
-    crash_fig.update_layout(template="plotly_white")
 
     # HOURLY CHART
     hourly_data = (
-        hour_view.groupby("CRASH HOUR")["Number_of_Crashes"]
+        hour_view
+        .groupby("CRASH_HOUR")["Number_of_Crashes"]
         .sum()
         .reindex(range(24), fill_value=0)
         .rename_axis("Hour")
@@ -471,34 +832,53 @@ def update_dashboard(selected_borough):
         labels={
             "Hour": "Hour (24-hour clock)",
             "Number_of_Crashes": "Reported Crashes"
-        }
+        },
+        template="plotly_white"
     )
 
-    hour_fig.update_xaxes(tickmode="linear", dtick=1)
-    hour_fig.update_layout(template="plotly_white")
+    hour_fig.update_xaxes(
+        tickmode="linear",
+        dtick=1
+    )
 
-    # INTEGRATED DATA CHART
+    # INTEGRATION CHART
     integration_fig = px.scatter(
         integrated_view,
-        x="Housing_Total_Units",
-        y="Number_of_Crashes",
-        color="BOROUGH_KEY",
-        hover_data=["ZIP_KEY"],
+        x="counted_housing_units",
+        y="total_crashes",
+        color="Borough",
+        hover_data=[
+            "Postcode",
+            "housing_projects",
+            "total_injured",
+            "total_killed"
+        ],
         title="Housing Units vs. Crashes by Matched ZIP Code",
         labels={
-            "Housing_Total_Units": "Counted Housing Units",
-            "Number_of_Crashes": "Reported Crashes",
-            "BOROUGH_KEY": "Borough"
-        }
+            "counted_housing_units": "Counted Housing Units",
+            "total_crashes": "Reported Crashes",
+            "Borough": "Borough"
+        },
+        template="plotly_white"
     )
 
-    integration_fig.update_layout(template="plotly_white")
+    for fig in [
+        housing_fig,
+        crash_fig,
+        hour_fig,
+        integration_fig
+    ]:
+        fig.update_layout(
+            margin=dict(l=35, r=25, t=65, b=45)
+        )
 
     return (
+
         housing_fig,
         crash_fig,
         hour_fig,
         integration_fig,
+
         f"{housing_total:,.0f}",
         f"{crashes_total:,.0f}",
         f"{injuries_total:,.0f}",
@@ -506,10 +886,66 @@ def update_dashboard(selected_borough):
     )
 
 
-# --------------------------------------------------
-# 8. RUN WEBSITE
-# --------------------------------------------------
+# ==================================================
+# 11. GENERATE REPORT
+# ==================================================
+
+@app.callback(
+
+    Output("download-report", "data"),
+
+    Input("generate-report", "n_clicks"),
+
+    State("borough-filter", "value"),
+    State("year-filter", "value"),
+    State("search-input", "value"),
+    State("housing-category-filter", "value"),
+    State("crash-category-filter", "value"),
+
+    prevent_initial_call=True
+)
+
+def generate_report(
+    n_clicks,
+    selected_borough,
+    selected_year,
+    search_term,
+    selected_housing_category,
+    selected_crash_factor
+):
+
+    _, _, _, report_data = get_filtered_data(
+        selected_borough,
+        selected_year,
+        search_term,
+        selected_housing_category,
+        selected_crash_factor
+    )
+
+    report_data = report_data.copy()
+
+    # Include selected dashboard filters in the report
+    report_data["Selected_Year_Filter"] = selected_year
+    report_data["Selected_Housing_Category"] = selected_housing_category
+    report_data["Selected_Crash_Category"] = selected_crash_factor
+
+    return dcc.send_data_frame(
+        report_data.to_csv,
+        "NYC_Housing_Crashes_Report.csv",
+        index=False
+    )
+
+
+# ==================================================
+# 12. RUN DASHBOARD
+# ==================================================
 
 if __name__ == "__main__":
+
     print("Starting NYC Housing and Crash Dashboard...")
-    app.run(debug=False, host="127.0.0.1", port=8050)
+
+    app.run(
+        debug=False,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8050))
+    )

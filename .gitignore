@@ -11,5 +11,7 @@ __pycache__/
 # Private configuration
 .env
 
-# Large crash dataset
+# Large crash datasets
 /data/crashes.csv
+/data/crashes_clean.csv
+/data/crashes_clean.csv.gz

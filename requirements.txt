@@ -7,3 +7,4 @@ dash
 statsmodels
 gunicorn
 jupyter
+pyarrow
