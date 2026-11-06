@@ -1,3 +1,3 @@
-from app import server
+from dashboard import server
 
 app = server
